@@ -2,14 +2,14 @@
 
 An interesting question came up in the Personal KDB+ mailing list: How can you efficiently find the top 100 most expensive rides in a dataset of 1.43 billion rows?
 
-The initial poster pointed out that loading the whole table into RAM and sorting all of it didn't seem like the best way. A number of suggestions came up, including the idiomatic `select[100;>total_amount]` approach which will run *idesc* on a single column ('>' is *k* for *idesc*), and then using the resulting indexes to retrieve the records of interest. This is a huge improvement to the original and likely the way to go for most scenarios. This doesn't work directly in a partitioned database since the i column is only unique for each partition. *.Q.ind* allows indexing into partitioned table:
+The initial poster pointed out that loading the whole table in RAM and sorting all of it seemed very inefficient and asked for a better way. A number of suggestions came up, including the idiomatic `select[100;>total_amount]` approach. This will run *idesc* on a single column ('>' is *k* for *idesc*), and then using the resulting indexes to retrieve the records of interest. Not loading the whole table in RAM is a huge improvement and this method is normally the way to go. The syntax doesn't work directly in a partitioned database since the i column is not globally unique: it starts at zero for each partition. *.Q.ind* uses the partition counts to translate the global indexes into locals and returns the desired rows:
 
     q).Q.ind[trips](select idesc total_amount from trips)`total_amount
 
-This will achieve most of the original goal but *idesc* still uses a fair amount of memory, enough to make a 32-bit 'home' version give up the ghost (wsfull) on a database of 10*5M rows. This will place a hard limit on the amount of rows that can be processed. I'm confident we'll see databases with 20 billion taxi rides in a few years. More egregious is the fact that *idesc* will sort every last row in the dataset, whereas we only need the binary distinction "hot or not". The 100 hotties can be sorted afterwards.
+This will achieve most of the original goal but *idesc* still uses a fair amount of memory, enough to make a 32-bit 'home' version give up the ghost (wsfull) on a database of 10*5M rows. This will place a hard limit on the amount of rows that can be processed. We could run on 64-bit, but memory is still limited and data is growing fast. I'm confident we'll see databases with 20 billion taxi rides soon. Besides using a lot of memory, *idesc* will sort every last row in the dataset, whereas we only need the binary distinction "hot or not". The 100 hotties can be sorted afterwards.
 
 ## Binary threshold search
-But can we do better? A scan of StackOverflow yielded terms like min-heap, priority-queues. I tried a few but KDB+ wasn't designed for mutating data and the performance dropped. I thought about how to apply vector programming and realised KDB+ shines when it comes to do doing a simple operation across a humongous list. What if we could avoid sorting altogether?
+But can we do better? A scan of StackOverflow yielded terms like min-heap, priority-queues. I tried a few but KDB+ wasn't born to mutate a small list of data and the performance dropped. I thought about how to apply vector programming and realised KDB+ wants to do a simple operations on a big vector. It's unlikely that we can sort faster than the built-in algorithms. What if we could avoid sorting altogether?
 
 The idea is to look for a threshold value that only the top 100 are greater than. If we can quickly test how many values are above the threshold, we can hone in to the desired selection. The first question is whether this approach has merit in principle. An initial test looks promising:
 
@@ -21,9 +21,9 @@ The idea is to look for a threshold value that only the top 100 are greater than
 
 If we could limit the number of iterations to less than 10-20 we might win time. One approach to conducting a binary search is to start in the middle, measure, and then go left or right depending on the result, halving the step size on every step. However given the fact that we're looking for the top and we have some ideas about the data, we might be able to do better. Three basic paradigms come to mind:
 
- 1. The data is distributed evenly
- 2. The data is distributed normally
- 3. All data sits in one corner of the spectrum
+ 1. The data is evenly distributed
+ 2. The data is normally distributed
+ 3. The data is not distributed at all
 
 ### Evenly distributed
 A [textbook](https://www.amazon.co.uk/Tips-Fast-Scalable-Maintainable-Kdb-ebook/dp/B00UZ8OMME/ref=sr_1_1?ie=UTF8&qid=1531091343&sr=8-1&keywords=psaris%20q%20tips) example of a KDB dataset would be:
@@ -48,23 +48,25 @@ The estimate is a little trickier, but we can borrow the *xn* function from stat
     q)estimate:stats[`avg]+stats[`dev]*xn 1-n%stats[`count];
 
 
-### All data in one corner
+### Not distributed at all
 
     q)list:(10000000#0.0),100.0
 
 There's no real value to an estimate here. All we'd need to do is make sure that the algorithm doesn't run away or takes way longer. I used this to verify the worst case scenario.
  
 
-## Converging
-Now that we have a decent estimate we can try to converge on a threshold value. Starting from our initial estimate, we can double the distance until the population is larger than 100. We're okay with more, not with less. The *over* adverb offers an overload that takes a predicate function. We can start with our estimate and iterate until the predicate function returns 1b. To measure the population at a given threshold we can omit the right argument for the > operator.
+## Finding the threshold
+I'm making the assumption that normal distributions will on average occur more often in real life scenarios. You can always plugin the even estimate if that suits you better. So now that we have a decent estimate we can start converging on a threshold value. 
+
+Starting from our initial estimate, we can double the distance until the population is larger than 100. We're okay with more, not with less. The *over* adverb offers an overload that takes a predicate function. We can start with our estimate and iterate until the predicate function returns 0b. To measure the population at a given threshold we can omit the right argument for the > operator.
 
     n>sum list>
 
-When placed within parentheses or brackets, this yields a projected function that can be called, without the  currying we'd need to do since q only sees local and global scope, but not variables in the outer function:
+When placed within parentheses or brackets, this yields a projected function that can be called, without the currying we'd need to do since q only sees local and global scope, but not variables in the outer function:
 
     {[n;list;x] n>sum list x}[n;list]
 
-The iterator will start with the estimate, assess the population at that threshold, and if it's smaller than the desired 100, call the iteration function which will move it to left, doubling the distance from the max value. Since there is a possibility that the estimate is more than the max the distance is made absolute:
+The iterator will start with the estimate, assess the population at that threshold, and if it's smaller than the desired 100, call the iteration function which will move it to left, doubling the distance from the max value.
 
     q)threshold:{[top;x]top- 2*abs top-x}[max list]/[n>sum list>;estimate]
 
@@ -73,9 +75,17 @@ The last step is to use this threshold to harvest the actual records. We can get
     q)trips where list>threshold
 
 ## But wait, there's less*...
-At this point we'll have solved the puzzle for in-memory data, but a nice improvement since [version 3.5](https://code.kx.com/q/ref/releases/ChangesIn3.5/) is that multiple threads can read into the same memory area. This means that the floor is opened for in-memory parallelism in this case. Earlier versions achieved thread-safety by copying serialised data sets over, now this is possible without that overhead. We can run multiple comparison operations on the same large list. More vectorisation. Instead of writing decision logic and mutating values, we just do the raw work very smartly. In this case we can take out the converging logic.
+At this point we'll have solved the puzzle for in-memory data, but a nice improvement since [version 3.5](https://code.kx.com/q/ref/releases/ChangesIn3.5/) is that multiple threads can read into the same memory area. Earlier versions achieved thread-safety by sending the data set in serialised form to the other thread, but now this expensive step can be avoided. This means that the floor is open for in-memory parallelism. Instead of taking it step by step, we can predict which comparisons we want run and execute them all at the same time. More vectorisation. Instead of writing decision logic and mutating values, we empathise with the machine and feed it what it likes: Long lists of neatly arranged, boring operations. In this case we can take out the converging logic.
 
-Firstly a series of thresholds that we want evaluate is generated following the same logic, but all the way until the threshold is lower than the minimum. We don't need that last one.
+Given 30 million floats, in the time we can iterate 3 times in series, we can blast 11 parallel compares through my 8-core machine:
+
+    q)list:30000000?100.0
+    q)\ts [list<]each 1.0*til 3
+    381 100663920
+    q)\ts [list<]peach 1.0*til 11
+    334 1168
+
+Ergo, why not decide on a number of thresholds to test, and test these in parallel. Then pick the best one. 
 
 The heavy lifting can now be shared by all the cores and since we're at it, the same applies to the stats. On a data set of 30M records, all this shaves off another 20-30% of the running time.
 
@@ -92,7 +102,7 @@ The heavy lifting can now be shared by all the cores and since we're at it, the 
 ## Partitioned table
 KDB+ is what happens when you use q to store and query data on disk. Whereas in memory some of the multithreading management falls on the programmer, when querying with KDB+ a number of important tasks are run in parallel by default. On disk data can not be changed implicitly which means mistakes or temporary changes will be cleaned up on the next *\l*. Each partition will be queried separately and the results will be stitched together cleanly. Even more impressive is the fact that map-reduce is implemented implicitly - an average is calculated by adding up all the sums and dividing by the sum of counts. The individual sums can be calculated separately.
 
-Data is mapped in memory when the table is loaded, and only read from the device when accessed. After the first read, the file cache will be primed and subsequent access is a lot faster. This is elegant as KDB+ as it separate the concerns cleanly. 
+Data is mapped into memory when the table is loaded, and only read from the device when accessed. After the first read, the file cache will be primed and subsequent access is a lot faster. This is elegant as it separate the concerns cleanly. 
 
 All this comes at the cost 
 
@@ -144,6 +154,11 @@ How could we make this faster?
         ?[table;enlist(>;field;threshold);0b;()]
      };
 
+## Lessons learned
+Optimisation for a limited amount of use cases
+
 
 
 * After Jeff Borror's introductory video series on Kx's YouTube channel
+
+
