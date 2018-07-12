@@ -12,7 +12,7 @@ topN:{[list;n]
 	n#l idesc l:list i
  };
 
-list:nor 10000000
+list:nor 65000000
 /list:30000000?100.0
 /list:100.0,(30000000#0.0)
 / \ts show 100#desc list

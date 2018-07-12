@@ -9,7 +9,13 @@ The initial poster pointed out that loading the whole table in RAM and sorting a
 This will achieve most of the original goal but *idesc* still uses a fair amount of memory, enough to make a 32-bit 'home' version give up the ghost (wsfull) on a database of 10*5M rows. This will place a hard limit on the amount of rows that can be processed. We could run on 64-bit, but memory is still limited and data is growing fast. I'm confident we'll see databases with 20 billion taxi rides soon. Besides using a lot of memory, *idesc* will sort every last row in the dataset, whereas we only need the binary distinction "hot or not". The 100 hotties can be sorted afterwards.
 
 ## Binary threshold search
-But can we do better? A scan of StackOverflow yielded terms like min-heap, priority-queues. I tried a few but KDB+ wasn't born to mutate a small list of data and the performance dropped. I thought about how to apply vector programming and realised KDB+ wants to do a simple operations on a big vector. It's unlikely that we can sort faster than the built-in algorithms. What if we could avoid sorting altogether?
+But can we do better? A scan of StackOverflow yielded terms like min-heap, priority-queues. I tried a few, like this one:
+
+    q)list:1000000?100.0
+    q)\ts t:{$[0>i:y bin z;z,y;x sublist(l#y),z,(l:i+1)_y]}[-100]/[();list]
+    2409 5040
+
+This can't be parallelised as the algorithm constantly needs the latest state to make its next decision. The memory usage is minimal, but we can certainly spare a megabyte here and there if it speeds things up. Q wasn't born to mutate small amounts of data and make a lot of decisions. It's optimised to process long homogenous lists. It's unlikely that we can sort faster than the [built-in algorithms](https://code.kx.com/q/ref/releases/ChangesIn3.5/#improved-sort-performance). What if we could avoid sorting altogether?
 
 The idea is to look for a threshold value that only the top 100 are greater than. If we can quickly test how many values are above the threshold, we can hone in to the desired selection. The first question is whether this approach has merit in principle. An initial test looks promising:
 
@@ -85,7 +91,17 @@ Given 30 million floats, in the time we can iterate 3 times in series, we can bl
     q)\ts [list<]peach 1.0*til 11
     334 1168
 
-Ergo, why not decide on a number of thresholds to test, and test these in parallel. Then pick the best one. 
+Ergo, why not decide on a number of thresholds to test, and test these in parallel. Then pick the one that yields the smallest result set greater than the requested amount. 
+
+    q)peach[list<;0 1 2]
+    01100011100100011101011010111000100001111010000..
+    01110011111111011101111011111111100111111111011..
+    11111011111111111111111111111111111111111111111..
+
+In this case '4' would be our candidate threshold as 2015 is the smallest number greater than 100:
+
+    q)peach[sum list>;1 2 3 4 5]
+    10310258 1477697 88062 2015 23i
 
 The heavy lifting can now be shared by all the cores and since we're at it, the same applies to the stats. On a data set of 30M records, all this shaves off another 20-30% of the running time.
 
@@ -97,7 +113,20 @@ The heavy lifting can now be shared by all the cores and since we're at it, the 
         n#list i idesc list i:where list>threshold
      };
 
- 
+From here, it was possible to optimise further by incremental profiling. On my normally distributed test set it turned out to be cheaper to make a more radical assumption about the thresholds: Measure 4/8, 2/8 and 1/8 from the right, run that in parallel and then sort whatever is left. Further optimisation included avoiding re-doing the harvesting, since we already had the information. In the below only the *min* and *max* stats, and *list>* calls add significant time:
+
+    topN:{[list;n]
+        stats:`min`max!@[;list]peach(min;max);
+        series:stats[`max]-1 2 4*(stats[`max]-stats[`min])%8;
+        i:where d first where n<sum peach d:peach[list>;series];
+        n#l idesc l:list i
+     };
+
+On a test set of 65 million this takes under 450ms:
+
+    q)list:nor 65000000
+    q)\ts topN[list;100]
+    433 25008
 
 ## Partitioned table
 KDB+ is what happens when you use q to store and query data on disk. Whereas in memory some of the multithreading management falls on the programmer, when querying with KDB+ a number of important tasks are run in parallel by default. On disk data can not be changed implicitly which means mistakes or temporary changes will be cleaned up on the next *\l*. Each partition will be queried separately and the results will be stitched together cleanly. Even more impressive is the fact that map-reduce is implemented implicitly - an average is calculated by adding up all the sums and dividing by the sum of counts. The individual sums can be calculated separately.
@@ -160,5 +189,12 @@ Optimisation for a limited amount of use cases
 
 
 * After Jeff Borror's introductory video series on Kx's YouTube channel
+
+
+
+
+
+
+
 
 
